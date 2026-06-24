@@ -1,10 +1,72 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { execSync } from "child_process";
-import fs from "fs";
-import path from "path";
-import os from "os";
+import { v2 as cloudinary } from "cloudinary";
 
 export const config = { api: { bodyParser: false } };
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+async function streamToBuffer(stream) {
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
+async function parseMultipart(req) {
+  const buffer = await streamToBuffer(req);
+  const boundary = req.headers["content-type"].split("boundary=")[1];
+  const parts = buffer.toString("binary").split("--" + boundary);
+  const result = { fields: {}, videoBuffer: null };
+  for (const part of parts) {
+    if (part.includes("Content-Disposition")) {
+      const nameMatch = part.match(/name="([^"]+)"/);
+      if (!nameMatch) continue;
+      const name = nameMatch[1];
+      const start = part.indexOf("\r\n\r\n") + 4;
+      const end = part.lastIndexOf("\r\n");
+      if (part.includes("filename=")) {
+        result.videoBuffer = Buffer.from(part.slice(start, end), "binary");
+      } else {
+        result.fields[name] = part.slice(start, end).trim();
+      }
+    }
+  }
+  return result;
+}
+
+async function uploadToCloudinary(buffer) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      { resource_type: "video", folder: "trf-analyzer", eager: [{ format: "jpg", transformation: [{ width: 800 }] }] },
+      (error, result) => { if (error) reject(error); else resolve(result); }
+    );
+    stream.end(buffer);
+  });
+}
+
+async function extractFrames(publicId, durationSeconds) {
+  const frameCount = Math.min(12, Math.ceil(durationSeconds / 5));
+  const frames = [];
+  for (let i = 0; i < frameCount; i++) {
+    const offset = Math.round((i / frameCount) * durationSeconds);
+    const url = cloudinary.url(publicId, {
+      resource_type: "video",
+      format: "jpg",
+      transformation: [{ width: 800, crop: "scale" }, { start_offset: offset }],
+    });
+    frames.push(url);
+  }
+  return frames;
+}
+
+async function urlToBase64(url) {
+  const res = await fetch(url);
+  const buf = await res.arrayBuffer();
+  return Buffer.from(buf).toString("base64");
+}
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -13,100 +75,64 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ erro: "Método não permitido" });
 
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "trf-"));
-  const videoPath = path.join(tmpDir, "video.mp4");
-  const framesDir = path.join(tmpDir, "frames");
-  fs.mkdirSync(framesDir);
+  let cloudinaryPublicId = null;
 
   try {
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    const buffer = Buffer.concat(chunks);
-
-    const boundary = req.headers["content-type"].split("boundary=")[1];
-    const bodyStr = buffer.toString("binary");
-    const parts = bodyStr.split("--" + boundary);
-
-    let videoBuffer = null;
-    let empresa = "";
-    let linha = "";
-    let meta = 10;
-
-    for (const part of parts) {
-      if (part.includes('name="video"')) {
-        const start = part.indexOf("\r\n\r\n") + 4;
-        const end = part.lastIndexOf("\r\n");
-        videoBuffer = Buffer.from(part.slice(start, end), "binary");
-      }
-      if (part.includes('name="empresa"')) {
-        empresa = part.split("\r\n\r\n")[1]?.trim() || "";
-      }
-      if (part.includes('name="linha"')) {
-        linha = part.split("\r\n\r\n")[1]?.trim() || "";
-      }
-      if (part.includes('name="meta"')) {
-        meta = parseInt(part.split("\r\n\r\n")[1]?.trim()) || 10;
-      }
-    }
-
+    const { fields, videoBuffer } = await parseMultipart(req);
     if (!videoBuffer) return res.status(400).json({ erro: "Vídeo não recebido" });
-    fs.writeFileSync(videoPath, videoBuffer);
 
-    try {
-      execSync(`ffmpeg -i ${videoPath} -vf fps=1/5 -q:v 2 ${framesDir}/frame%03d.jpg`, { timeout: 60000 });
-    } catch (e) {
-      return res.status(500).json({ erro: "Erro ao processar vídeo. Verifique se o arquivo é válido." });
-    }
+    const empresa = fields.empresa || "Não informado";
+    const linha = fields.linha || "Não informado";
+    const meta = parseInt(fields.meta) || 10;
 
-    const frameFiles = fs.readdirSync(framesDir).filter(f => f.endsWith(".jpg")).sort();
-    if (frameFiles.length === 0) return res.status(500).json({ erro: "Nenhum frame extraído do vídeo." });
+    const uploadResult = await uploadToCloudinary(videoBuffer);
+    cloudinaryPublicId = uploadResult.public_id;
+    const duration = uploadResult.duration || 60;
 
-    const framesSample = frameFiles.slice(0, 12);
-    const imagesContent = framesSample.map((f, i) => {
-      const imgData = fs.readFileSync(path.join(framesDir, f));
-      return {
-        type: "image",
-        source: { type: "base64", media_type: "image/jpeg", data: imgData.toString("base64") }
-      };
-    });
+    const frameUrls = await extractFrames(cloudinaryPublicId, duration);
 
-    const duracaoEstimada = frameFiles.length * 5;
+    const imagesContent = await Promise.all(
+      frameUrls.map(async (url) => {
+        try {
+          const b64 = await urlToBase64(url);
+          return { type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } };
+        } catch { return null; }
+      })
+    );
+    const validImages = imagesContent.filter(Boolean);
 
     const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
     const response = await client.messages.create({
       model: "claude-sonnet-4-6",
       max_tokens: 4000,
       messages: [{
         role: "user",
         content: [
-          ...imagesContent,
+          ...validImages,
           {
             type: "text",
             text: `Você é especialista em TRF (Troca Rápida de Ferramenta) baseado em Shigeo Shingo (1985).
 
-Analise estes frames de uma filmagem de setup industrial da linha "${linha}" da empresa "${empresa}".
-Duração estimada do vídeo: ${duracaoEstimada} segundos. Meta de setup: ${meta} minutos.
+Analise os frames desta filmagem de setup industrial.
+Empresa: "${empresa}" | Linha: "${linha}" | Meta: ${meta} minutos | Duração: ${Math.round(duration)}s
 
-Identifique todas as atividades de setup visíveis nos frames e classifique cada uma.
+REGRAS:
+- Setup EXTERNO: pode ser feito com máquina produzindo (buscar ferramentas, separar insumos, ler OP, pré-aquecer)
+- Setup INTERNO: só com máquina completamente parada (trocar matriz, limpar cabeçote, fixar ferramental, ajustar guias)
 
-REGRAS OBRIGATÓRIAS:
-- Setup EXTERNO: pode ser feito com a máquina produzindo o lote anterior (buscar ferramentas, separar insumos, ler OP, pré-aquecer)
-- Setup INTERNO: só pode ser feito com a máquina completamente parada (trocar matriz, limpar cabeçote, fixar ferramental, ajustar guias)
-
-Retorne SOMENTE um JSON válido, sem texto antes ou depois, neste formato exato:
+Retorne SOMENTE JSON válido sem texto adicional:
 {
   "empresa": "${empresa}",
   "linha": "${linha}",
   "meta_minutos": ${meta},
-  "duracao_total_segundos": ${duracaoEstimada},
+  "duracao_total_segundos": ${Math.round(duration)},
   "tarefas": [
     {
-      "tarefa": "nome da atividade observada",
-      "tipo": "interno" ou "externo",
-      "duracao_segundos": número estimado,
-      "motivo": "justificativa técnica baseada em Shingo em 2 linhas",
-      "oportunidade": "sugestão de melhoria ou conversão para externo"
+      "tarefa": "nome da atividade",
+      "tipo": "interno",
+      "duracao_segundos": 60,
+      "motivo": "justificativa técnica em 2 linhas baseada em Shingo",
+      "oportunidade": "sugestão de melhoria"
     }
   ]
 }`
@@ -136,6 +162,8 @@ Retorne SOMENTE um JSON válido, sem texto antes ou depois, neste formato exato:
   } catch (err) {
     return res.status(500).json({ erro: "Erro interno: " + err.message });
   } finally {
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+    if (cloudinaryPublicId) {
+      cloudinary.uploader.destroy(cloudinaryPublicId, { resource_type: "video" }).catch(() => {});
+    }
   }
 }
